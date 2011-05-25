@@ -5,6 +5,9 @@ import static org.deftserver.web.http.HttpServerDescriptor.WRITE_BUFFER_SIZE;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
@@ -110,23 +113,41 @@ public class HttpResponse {
 	public long finish() {
 		long bytesWritten = 0;
 		SocketChannel clientChannel = (SocketChannel) key.channel();
-		if (clientChannel.isOpen()) {
-			if (!headersCreated) {
-				setEtagAndContentLength();
+		Object attachment = key.attachment();
+
+		if (attachment instanceof MappedByteBuffer) {
+			MappedByteBuffer mbb = (MappedByteBuffer) attachment;
+			if (mbb.hasRemaining() && clientChannel.isOpen()) {
+				try {
+					bytesWritten = clientChannel.write(mbb);
+				} catch (Exception e) {
+					Closeables.closeQuietly(key.channel());
+					e.printStackTrace();
+				}
 			}
-			bytesWritten = flush();
-		}
-		
-		// close (or register for read) iff 
-		// (a) DBB is attached but all data is sent to wire (hasRemaining == false)
-		// (b) no DBB is attached (never had to register for write)
-		if (key.attachment() instanceof DynamicByteBuffer) {
-			DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
-			if (!(dbb).hasRemaining()) {
+			if (!mbb.hasRemaining()) {
+				key.attach(null);
 				protocol.closeOrRegisterForRead(key);
-			} 
+			}
 		} else {
-			protocol.closeOrRegisterForRead(key);
+			if (clientChannel.isOpen()) {
+				if (!headersCreated) {
+					setEtagAndContentLength();
+				}
+				bytesWritten = flush();
+			}
+			// close (or register for read) if
+			// (a) DBB is attached but all data is sent to wire (hasRemaining ==
+			// false)
+			// (b) no DBB is attached (never had to register for write)
+			if (attachment instanceof DynamicByteBuffer) {
+				DynamicByteBuffer dbb = (DynamicByteBuffer) attachment;
+				if (!(dbb).hasRemaining()) {
+					protocol.closeOrRegisterForRead(key);
+				}
+			} else {
+				protocol.closeOrRegisterForRead(key);
+			}
 		}
 		return bytesWritten;
 	}
@@ -160,23 +181,28 @@ public class HttpResponse {
 		setHeader("Content-Length", String.valueOf(file.length()));
 		long bytesWritten = 0;
 		flush(); // write initial line + headers
-		RandomAccessFile raf = null;
 		try {
-			raf = new RandomAccessFile(file, "r");
-			bytesWritten = raf.getChannel().transferTo(0, file.length(), (SocketChannel) key.channel());
-			logger.debug("sent file, bytes sent: {}", bytesWritten);
+			RandomAccessFile raf = new RandomAccessFile(file, "r");
+			FileChannel fc = raf.getChannel();
+			long fsize = fc.size();
+			MappedByteBuffer mbb = fc.map(MapMode.READ_ONLY, 0L, fsize);
+			raf.close();
+
+			if (mbb.hasRemaining()) {
+				bytesWritten = ((SocketChannel) key.channel()).write(mbb);
+			}
+			if (mbb.hasRemaining()) {
+				try {
+					key.channel().register(key.selector(),
+							SelectionKey.OP_WRITE);
+				} catch (ClosedChannelException e) {
+					Closeables.closeQuietly(key.channel());
+				}
+				key.attach(mbb);
+			}
 		} catch (IOException e) {
 			logger.error("Error writing (static file) response: {}", e.getMessage());
-		} finally {
-			if (raf != null) {
-				try {
-					raf.close();
-				} catch (IOException e) {
-					logger.error("Error closing static file: ", e.getMessage());					
-				}
-			}
 		}
-
 		return bytesWritten;
 	}
 	
